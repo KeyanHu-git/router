@@ -1,6 +1,7 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
+use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -9,7 +10,7 @@ use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
-use crate::routers::{RouterTrait, WorkerManagement};
+use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -771,7 +772,7 @@ impl VllmPDRouter {
         start_time: Instant,
         is_streaming: bool,
         needs_logprobs: bool,
-        user_stop: bool,
+        validate_recomputed: bool,
     ) -> Result<Response, String> {
         debug!(
             "Decode server responded with status: {}",
@@ -791,15 +792,97 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_decode_error(decode_http);
         }
 
-        super::recompute_guard::decode_response(
-            decode_response,
-            prefill_response_json,
-            is_streaming,
-            needs_logprobs,
-            user_stop,
-            path,
-        )
-        .await
+        let validate_recomputed = validate_recomputed && decode_response.status().is_success();
+        if validate_recomputed {
+            if let Some(error) = super::recompute_guard::encoding_error(&decode_response) {
+                return Ok(error);
+            }
+        }
+
+        if needs_logprobs && !is_streaming {
+            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
+
+            let status = decode_response.status();
+            let resp_headers = decode_response.headers().clone();
+            let decode_body = decode_response
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to read decode response: {}", e))?;
+
+            let mut decode_json: Value = serde_json::from_slice(&decode_body)
+                .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
+
+            if validate_recomputed && super::recompute_guard::is_recomputed(&decode_json) {
+                return Ok(super::recompute_guard::failure_response());
+            }
+
+            let empty_json = Value::Null;
+            let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
+            let merged = logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json);
+            if merged {
+                debug!("Successfully merged logprobs from prefill and decode responses");
+            } else {
+                warn!("No logprobs were merged (might be expected if logprobs not in response)");
+            }
+
+            let merged_body = serde_json::to_vec(&decode_json)
+                .map_err(|e| format!("Failed to serialize merged response: {}", e))?;
+
+            let mut response_builder = axum::http::Response::builder().status(status);
+            for (name, value) in resp_headers.iter() {
+                response_builder = response_builder.header(name, value);
+            }
+            return response_builder
+                .body(axum::body::Body::from(merged_body))
+                .map_err(|e| format!("Failed to build response: {}", e));
+        }
+
+        debug!(
+            "No logprobs merging needed (streaming={}, needs_logprobs={})",
+            is_streaming, needs_logprobs
+        );
+
+        let status = decode_response.status();
+
+        if is_streaming {
+            let mut response_builder = axum::http::Response::builder().status(status);
+            let mut decode_headers =
+                header_utils::preserve_response_headers(decode_response.headers());
+            decode_headers.remove(axum::http::header::CONTENT_LENGTH);
+            for (name, value) in decode_headers.iter() {
+                response_builder = response_builder.header(name, value);
+            }
+            let body = if validate_recomputed {
+                Body::from_stream(super::recompute_guard::guard_stream(
+                    decode_response.bytes_stream(),
+                ))
+            } else {
+                Body::from_stream(decode_response.bytes_stream())
+            };
+            return response_builder.body(body).map_err(|e| {
+                format!(
+                    "Failed to build streaming response from {}: {}",
+                    decode_http, e
+                )
+            });
+        }
+
+        // Non-streaming, no logprobs: read entire body
+        let decode_headers = decode_response.headers().clone();
+        let body = decode_response
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to read decode response: {}", e))?;
+        if validate_recomputed && super::recompute_guard::interrupted(&body) {
+            return Ok(super::recompute_guard::failure_response());
+        }
+        let mut response_builder = axum::http::Response::builder().status(status);
+        for (name, value) in decode_headers.iter() {
+            response_builder = response_builder.header(name, value);
+        }
+        response_builder
+            .body(axum::body::Body::from(body))
+            .map_err(|e| format!("Failed to build response: {}", e))
     }
 
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
@@ -1155,7 +1238,7 @@ impl VllmPDRouter {
                     start_time,
                     is_streaming,
                     needs_logprobs,
-                    super::recompute_guard::marker_is_user_stop(&request_json),
+                    super::recompute_guard::enabled(path, &request_json),
                 )
                 .await;
         }
@@ -1197,7 +1280,7 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
-            super::recompute_guard::marker_is_user_stop(&request_json),
+            super::recompute_guard::enabled(path, &request_json),
         )
         .await
     }
@@ -1631,16 +1714,109 @@ impl VllmPDRouter {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        super::recompute_guard::decode_response(
-            decode_response,
-            Some(&prefill_response_json),
-            is_streaming,
-            needs_logprobs,
-            super::recompute_guard::marker_is_user_stop(&original_request),
-            path,
-        )
-        .await
-        .map_err(|message| PDRouterError::NetworkError { message })
+        let validate_recomputed =
+            status.is_success() && super::recompute_guard::enabled(path, &original_request);
+        // If logprobs requested and non-streaming, merge prefill and decode logprobs
+        if validate_recomputed {
+            if let Some(error) = super::recompute_guard::encoding_error(&decode_response) {
+                return Ok(error);
+            }
+        }
+
+        if needs_logprobs && !is_streaming {
+            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
+
+            // Read decode response body
+            let decode_body =
+                decode_response
+                    .bytes()
+                    .await
+                    .map_err(|e| PDRouterError::NetworkError {
+                        message: format!(
+                            "Failed to read decode response from {}: {}",
+                            decode_url, e
+                        ),
+                    })?;
+
+            // Parse decode response as JSON
+            let mut decode_json: Value =
+                serde_json::from_slice(&decode_body).map_err(|e| PDRouterError::NetworkError {
+                    message: format!("Failed to parse decode response as JSON: {}", e),
+                })?;
+
+            if validate_recomputed && super::recompute_guard::is_recomputed(&decode_json) {
+                return Ok(super::recompute_guard::failure_response());
+            }
+
+            // Merge logprobs from prefill into decode response
+            let merged =
+                logprobs_merge::merge_logprobs_in_json(&prefill_response_json, &mut decode_json);
+            if merged {
+                debug!("Successfully merged logprobs from prefill and decode responses");
+            } else {
+                warn!("No logprobs were merged (might be expected if logprobs not in response)");
+            }
+
+            // Serialize merged response
+            let merged_body =
+                serde_json::to_vec(&decode_json).map_err(|e| PDRouterError::NetworkError {
+                    message: format!("Failed to serialize merged response: {}", e),
+                })?;
+
+            let mut response_builder = Response::builder().status(status);
+            for (key, value) in headers.iter() {
+                if key != "transfer-encoding" && key != "content-length" {
+                    response_builder = response_builder.header(key, value);
+                }
+            }
+
+            response_builder.body(Body::from(merged_body)).map_err(|e| {
+                PDRouterError::NetworkError {
+                    message: format!("Failed to build response from {}: {}", decode_url, e),
+                }
+            })
+        } else {
+            // No logprobs merging needed - return decode response as-is (streaming or no logprobs)
+            debug!(
+                "No logprobs merging needed (streaming={}, needs_logprobs={})",
+                is_streaming, needs_logprobs
+            );
+
+            let mut response_builder = Response::builder().status(status);
+            for (key, value) in headers.iter() {
+                if key != "transfer-encoding" && key != "content-length" {
+                    response_builder = response_builder.header(key, value);
+                }
+            }
+
+            let body = if validate_recomputed && is_streaming {
+                Body::from_stream(super::recompute_guard::guard_stream(
+                    decode_response.bytes_stream(),
+                ))
+            } else if validate_recomputed {
+                let bytes =
+                    decode_response
+                        .bytes()
+                        .await
+                        .map_err(|e| PDRouterError::NetworkError {
+                            message: format!(
+                                "Failed to read decode response from {}: {}",
+                                decode_url, e
+                            ),
+                        })?;
+                if super::recompute_guard::interrupted(&bytes) {
+                    return Ok(super::recompute_guard::failure_response());
+                }
+                Body::from(bytes)
+            } else {
+                Body::from_stream(decode_response.bytes_stream())
+            };
+            response_builder
+                .body(body)
+                .map_err(|e| PDRouterError::NetworkError {
+                    message: format!("Failed to build response from {}: {}", decode_url, e),
+                })
+        }
     }
 
     async fn try_build_concurrent_requests(
@@ -1853,7 +2029,7 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
-            super::recompute_guard::marker_is_user_stop(&decode_request),
+            super::recompute_guard::enabled(path, &decode_request),
         )
         .await
         .map_err(|message| PDRouterError::NetworkError { message })
