@@ -96,7 +96,7 @@ async fn decode(State(state): State<Backend>, Json(body): Json<Value>) -> Respon
         choice.as_object_mut().unwrap().remove("message");
         choice["delta"] = json!({});
         let events = format!(
-            "data: {}\r\n\r\ndata: {}\r\n\r\ndata: [DONE]\r\n\r\n",
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
             json!({"choices":[{"index":0,"delta":{"content":"A"},"finish_reason":null}]}),
             json!({"choices":[choice]})
         );

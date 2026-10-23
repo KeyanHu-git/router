@@ -79,6 +79,8 @@ pub(super) fn interrupted(bytes: &[u8]) -> bool {
     serde_json::from_slice::<Value>(bytes).is_ok_and(|value| is_recomputed(&value))
 }
 
+// Native vLLM Chat/Completions emit single-line JSON or keep-alive comments,
+// delimited by LF blank lines. Preserve complete frames without re-encoding them.
 pub(super) fn guard_stream<S, E>(stream: S) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -87,62 +89,24 @@ where
     async_stream::try_stream! {
         let mut source = Box::pin(stream);
         let mut raw = BytesMut::new();
-        let mut data = Vec::new();
-        let (mut scan, mut line_start) = (0, 0);
-        let (mut first, mut skip_lf, mut pending_fields) = (true, false, false);
+        let mut scan = 0;
         while let Some(chunk) = source.next().await {
             raw.extend_from_slice(&chunk.map_err(io::Error::other)?);
-            if first {
-                if raw.len() < 3 && b"\xef\xbb\xbf".starts_with(&raw) { continue; }
-                first = false;
-                if raw.starts_with(b"\xef\xbb\xbf") { scan = 3; line_start = 3; }
-            }
-            while scan < raw.len() {
-                let byte = raw[scan];
-                if std::mem::take(&mut skip_lf) && byte == b'\n' {
-                    scan += 1;
-                    line_start = scan;
-                    // The CR may already have released the preceding event.
-                    if scan == 1 {
-                        yield raw.split_to(1).freeze();
-                        scan = 0;
-                        line_start = 0;
-                    }
-                    continue;
-                }
-                if byte != b'\r' && byte != b'\n' { scan += 1; continue; }
-                let line = &raw[line_start..scan];
-                let empty = line.is_empty();
-                let comment = line.starts_with(b":");
-                if empty && interrupted(&data) {
+            while let Some(offset) = raw[scan..].windows(2).position(|pair| pair == b"\n\n") {
+                let end = scan + offset + 2;
+                let frame = raw.split_to(end).freeze();
+                scan = 0;
+                if frame[..frame.len() - 2].strip_prefix(b"data: ")
+                    .is_some_and(interrupted) {
                     drop(source);
                     yield Bytes::from(format!("data: {}\n\n", recomputed_error()));
                     return;
                 }
-                if empty {
-                    data.clear();
-                    pending_fields = false;
-                } else if !comment {
-                    pending_fields = true;
-                    let value = line.strip_prefix(b"data:")
-                        .map(|v| v.strip_prefix(b" ").unwrap_or(v))
-                        .or_else(|| (line == b"data").then_some(b"".as_slice()));
-                    if let Some(value) = value {
-                        data.extend_from_slice(value);
-                        data.push(b'\n');
-                    }
-                }
-                skip_lf = byte == b'\r';
-                scan += 1;
-                line_start = scan;
-                if empty || (comment && !pending_fields) {
-                    yield raw.split_to(scan).freeze();
-                    scan = 0;
-                    line_start = 0;
-                }
+                yield frame;
             }
+            // Retain the last byte so a delimiter can straddle chunks.
+            scan = raw.len().saturating_sub(1);
         }
-        // EOF does not dispatch an incomplete SSE event; preserve the original bytes.
         if !raw.is_empty() { yield raw.freeze(); }
     }
 }
@@ -194,7 +158,7 @@ mod tests {
 
     #[test]
     fn all_chunk_boundaries_suppress_recompute_and_done() {
-        let input = b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\",\"stop_reason\":\"recomputed\"}]}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let input = b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\",\"stop_reason\":\"recomputed\"}]}\n\ndata: [DONE]\n\n";
         for split in 0..=input.len() {
             let output = String::from_utf8(feed(&[&input[..split], &input[split..]])).unwrap();
             assert!(output.contains("upstream_recomputed"));
@@ -225,12 +189,18 @@ mod tests {
     }
 
     #[test]
-    fn multiline_bom_and_bare_cr() {
-        let input =
-            b"\xef\xbb\xbfdata: {\"choices\":\rdata: [{\"stop_reason\":\"recomputed\"}]}\r\r";
-        assert!(String::from_utf8(feed(&[input]))
-            .unwrap()
-            .contains("upstream_recomputed"));
+    fn native_frames_preserve_bytes_across_all_chunk_boundaries() {
+        let input = concat!(
+            ": keep-alive\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\\nworld\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes();
+        for split in 0..=input.len() {
+            assert_eq!(feed(&[&input[..split], &input[split..]]), input);
+        }
+        assert_eq!(feed(&input.chunks(1).collect::<Vec<_>>()), input);
     }
 
     #[test]
@@ -276,43 +246,6 @@ mod tests {
         assert_eq!(output.len(), 1);
         assert!(output[0].is_err());
     }
-    #[test]
-    fn metadata_heartbeats_and_bom_preserve_original_bytes() {
-        let input = b"\xef\xbb\xbf: heartbeat\r\nid: 7\r\nevent: message\r\nretry: 1000\r\ndata: {\"choices\":[]}\r\n\r\n: tail";
-        for split in 0..=input.len() {
-            assert_eq!(feed(&[&input[..split], &input[split..]]), input);
-        }
-    }
-
-    #[test]
-    fn comment_cannot_release_interrupted_data() {
-        let input = b"data: {\"choices\":[{\"stop_reason\":\"recomputed\"}]}\n: heartbeat\n\n";
-        let output = String::from_utf8(feed(&input.chunks(1).collect::<Vec<_>>())).unwrap();
-        assert!(output.contains("upstream_recomputed"));
-        assert!(!output.contains("stop_reason"));
-    }
-
-    #[test]
-    fn metadata_before_comment_cannot_change_error_event_type() {
-        let input = b"event: custom\nid: 42\n: heartbeat\ndata: {\"choices\":[{\"stop_reason\":\"recomputed\"}]}\n\n";
-        let output = String::from_utf8(feed(&input.chunks(1).collect::<Vec<_>>())).unwrap();
-        assert!(output.starts_with("data: {"));
-        assert!(!output.contains("event: custom"));
-        assert!(!output.contains("id: 42"));
-        assert_eq!(output.matches("upstream_recomputed").count(), 1);
-    }
-
-    #[test]
-    fn eof_cr_only_dispatches_a_complete_event() {
-        let line = b"data: {\"choices\":[{\"stop_reason\":\"recomputed\"}]}\r";
-        assert_eq!(feed(&[line]), line);
-        let normal = b"data: {\"choices\":[]}\r\r";
-        assert_eq!(feed(&[normal]), normal);
-        assert!(String::from_utf8(feed(&[line, b"\r"]))
-            .unwrap()
-            .contains("upstream_recomputed"));
-    }
-
     #[tokio::test]
     async fn upstream_is_dropped_before_error_is_delivered() {
         use std::sync::{
@@ -350,13 +283,13 @@ mod tests {
         assert!(output.next().await.is_none());
     }
     #[tokio::test]
-    async fn cr_event_is_delivered_without_waiting_for_more_bytes() {
-        for interrupted in [false, true] {
-            let data = if interrupted {
-                b"data: {\"choices\":[{\"stop_reason\":\"recomputed\"}]}\r\r".as_slice()
-            } else {
-                b"data: {\"choices\":[]}\r\r".as_slice()
-            };
+    async fn complete_event_is_delivered_without_waiting_for_more_bytes() {
+        for data in [
+            b": keep-alive\n\n".as_slice(),
+            b"data: {\"choices\":[]}\n\n".as_slice(),
+            b"data: {\"choices\":[{\"stop_reason\":\"recomputed\"}]}\n\n".as_slice(),
+        ] {
+            let interrupted = data.windows(10).any(|w| w == b"recomputed");
             let source =
                 futures_util::stream::iter(vec![Ok::<_, io::Error>(Bytes::copy_from_slice(data))])
                     .chain(futures_util::stream::pending());
@@ -364,7 +297,7 @@ mod tests {
             futures_util::pin_mut!(output);
             let event = tokio::time::timeout(std::time::Duration::from_millis(200), output.next())
                 .await
-                .expect("a complete CR event must not wait for another byte or EOF")
+                .expect("a complete LF event must not wait for another byte or EOF")
                 .unwrap()
                 .unwrap();
             if interrupted {
