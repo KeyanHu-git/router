@@ -12,11 +12,14 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 
+use crate::metrics::RouterMetrics;
+
 fn error_value(code: &str, message: &str) -> Value {
     json!({"error": {"message": message, "type": "upstream_error", "code": code}})
 }
 
 fn recomputed_error() -> Value {
+    RouterMetrics::record_pd_error("recomputed");
     error_value(
         "upstream_recomputed",
         "Decode was interrupted for recomputation; the router cannot resume this response.",
@@ -80,7 +83,7 @@ pub(super) fn interrupted(bytes: &[u8]) -> bool {
 }
 
 // Native vLLM Chat/Completions emit single-line JSON or keep-alive comments,
-// delimited by LF blank lines. Preserve complete frames without re-encoding them.
+// delimited by LF or CRLF blank lines. Preserve complete frames without re-encoding them.
 pub(super) fn guard_stream<S, E>(stream: S) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -92,8 +95,11 @@ where
         let mut scan = 0;
         while let Some(chunk) = source.next().await {
             raw.extend_from_slice(&chunk.map_err(io::Error::other)?);
-            while let Some(offset) = raw[scan..].windows(2).position(|pair| pair == b"\n\n") {
+            while let Some(end) = raw[scan..].windows(2).enumerate().find_map(|(offset, pair)| {
                 let end = scan + offset + 2;
+                (pair == b"\n\n" || (pair == b"\r\n" && end >= 3 && raw[end - 3] == b'\n'))
+                    .then_some(end)
+            }) {
                 let frame = raw.split_to(end).freeze();
                 scan = 0;
                 if frame[..frame.len() - 2].strip_prefix(b"data: ")
@@ -104,8 +110,8 @@ where
                 }
                 yield frame;
             }
-            // Retain the last byte so a delimiter can straddle chunks.
-            scan = raw.len().saturating_sub(1);
+            // Retain two bytes so LF and CRLF delimiters can straddle chunks.
+            scan = raw.len().saturating_sub(2);
         }
         if !raw.is_empty() { yield raw.freeze(); }
     }
@@ -308,5 +314,79 @@ mod tests {
                 assert_eq!(event.as_ref(), data);
             }
         }
+    }
+
+    #[test]
+    fn crlf_and_mixed_frames_preserve_bytes_and_detect_recompute() {
+        let normal = b": keep-alive\r\n\r\ndata: {\"choices\":[]}\n\ndata: [DONE]\r\n\r\n";
+        let interrupted = b": keep-alive\r\n\r\ndata: {\"choices\":[{\"stop_reason\":\"recomputed\"}]}\r\n\r\ndata: [DONE]\r\n\r\n";
+        for split in 0..=normal.len() {
+            assert_eq!(feed(&[&normal[..split], &normal[split..]]), normal);
+        }
+        for split in 0..=interrupted.len() {
+            let output =
+                String::from_utf8(feed(&[&interrupted[..split], &interrupted[split..]])).unwrap();
+            assert!(output.starts_with(": keep-alive\r\n\r\n"));
+            assert_eq!(output.matches("upstream_recomputed").count(), 1);
+            assert!(!output.contains("[DONE]"));
+        }
+        assert_eq!(feed(&normal.chunks(1).collect::<Vec<_>>()), normal);
+    }
+
+    #[tokio::test]
+    async fn crlf_frames_are_delivered_while_upstream_remains_pending() {
+        for data in [
+            b": keep-alive\r\n\r\n".as_slice(),
+            b"data: {\"choices\":[]}\r\n\r\n".as_slice(),
+            b"data: {\"choices\":[{\"stop_reason\":\"recomputed\"}]}\r\n\r\n".as_slice(),
+        ] {
+            for split in 0..=data.len() {
+                let source = futures_util::stream::iter(vec![
+                    Ok::<_, io::Error>(Bytes::copy_from_slice(&data[..split])),
+                    Ok(Bytes::copy_from_slice(&data[split..])),
+                ])
+                .chain(futures_util::stream::pending());
+                let output = guard_stream(source);
+                futures_util::pin_mut!(output);
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_millis(200), output.next())
+                        .await
+                        .expect("complete CRLF frame must be delivered before EOF")
+                        .unwrap()
+                        .unwrap();
+                if data.windows(10).any(|w| w == b"recomputed") {
+                    assert!(String::from_utf8(event.to_vec())
+                        .unwrap()
+                        .contains("upstream_recomputed"));
+                } else {
+                    assert_eq!(event.as_ref(), data);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recomputed_metric_counts_json_and_stream_once_each() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            assert_eq!(failure_response().status(), StatusCode::BAD_GATEWAY);
+            assert!(handle
+                .render()
+                .lines()
+                .any(|line| line == "vllm_router_pd_errors_total{error_type=\"recomputed\"} 1"));
+            let normal = b"data: {\"choices\":[]}\n\ndata: [DONE]\n\n";
+            assert_eq!(feed(&[normal]), normal);
+            assert!(handle
+                .render()
+                .lines()
+                .any(|line| line == "vllm_router_pd_errors_total{error_type=\"recomputed\"} 1"));
+            let output = feed(&[b"data: {\"choices\":[{\"stop_reason\":\"recomputed\"},{\"stop_reason\":\"recomputed\"}]}\n\ndata: [DONE]\n\n"]);
+            assert!(!String::from_utf8(output).unwrap().contains("[DONE]"));
+            assert!(handle
+                .render()
+                .lines()
+                .any(|line| line == "vllm_router_pd_errors_total{error_type=\"recomputed\"} 2"));
+        });
     }
 }
