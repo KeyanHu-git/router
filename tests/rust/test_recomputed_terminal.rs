@@ -91,10 +91,10 @@ async fn decode(State(state): State<Backend>, Json(body): Json<Value>) -> Respon
     let mut choice = json!({"index":0,"finish_reason":"stop","message":{"content":"A"},
         "logprobs":{"tokens":["A"],"token_logprobs":[-0.25],
         "text_offset":[0],"top_logprobs":[{"A":-0.25}]}});
-    if body["model"] == "interrupted" {
+    if body["model"].as_str().unwrap().starts_with("interrupted") {
         choice["stop_reason"] = json!("recomputed");
     }
-    if body["stream"] == true {
+    let response = if body["stream"] == true {
         choice.as_object_mut().unwrap().remove("message");
         choice["delta"] = json!({});
         let events = format!(
@@ -105,6 +105,26 @@ async fn decode(State(state): State<Backend>, Json(body): Json<Value>) -> Respon
         ([("content-type", "text/event-stream")], events).into_response()
     } else {
         Json(json!({"choices":[choice]})).into_response()
+    };
+    if body["model"].as_str().unwrap().ends_with("-gzip") {
+        use tokio::io::AsyncReadExt;
+        let content_type = response.headers()["content-type"].clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(bytes.as_ref());
+        let mut compressed = Vec::new();
+        encoder.read_to_end(&mut compressed).await.unwrap();
+        (
+            [
+                ("content-type", content_type),
+                ("content-encoding", "gzip".parse().unwrap()),
+            ],
+            compressed,
+        )
+            .into_response()
+    } else {
+        response
     }
 }
 
@@ -237,7 +257,13 @@ async fn exercise(push: bool, discovery: bool) {
         state.concurrent.store(true, Ordering::SeqCst);
     }
     for path in ["/v1/chat/completions", "/v1/completions"] {
-        for model in ["normal", "interrupted", "backend-error"] {
+        for model in [
+            "normal",
+            "interrupted",
+            "normal-gzip",
+            "interrupted-gzip",
+            "backend-error",
+        ] {
             for stream in [false, true] {
                 let logprobs_cases: &[Option<bool>] = if stream {
                     &[Some(true)]
@@ -288,7 +314,7 @@ async fn exercise(push: bool, discovery: bool) {
                             serde_json::from_str::<Value>(&body).unwrap(),
                             backend_error()
                         );
-                    } else if model == "interrupted" {
+                    } else if model.starts_with("interrupted") {
                         assert_eq!(
                             status,
                             if stream {

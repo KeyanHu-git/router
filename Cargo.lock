@@ -7412,6 +7412,7 @@ version = "0.1.16"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
+ "async-compression",
  "async-stream",
  "async-trait",
  "axum 0.8.9",
@@ -7433,6 +7434,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "lru",
+ "memchr",
  "metrics",
  "metrics-exporter-prometheus",
  "minijinja",
@@ -7460,6 +7462,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic 0.14.6",
  "tonic-health",
  "tower 0.5.3",

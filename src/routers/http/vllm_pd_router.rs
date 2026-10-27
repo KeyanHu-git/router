@@ -176,11 +176,39 @@ async fn finalize_decode_response(
         );
     }
 
-    if validate_recomputed {
-        if let Some(error) = super::recompute_guard::encoding_error(&decode_response) {
-            return Ok(error);
+    let gzip = if validate_recomputed {
+        match super::recompute_guard::gzip_encoded(&decode_response) {
+            Ok(gzip) => gzip,
+            Err(error) => return Ok(*error),
         }
-    }
+    } else {
+        false
+    };
+    let is_json = decode_response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"));
+    let content_length = decode_response.content_length();
+    let source = decode_response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+    let mut source = if gzip {
+        for header in [
+            "content-encoding",
+            "etag",
+            "content-md5",
+            "digest",
+            "content-digest",
+            "repr-digest",
+        ] {
+            headers.remove(header);
+        }
+        super::recompute_guard::gunzip(source).boxed()
+    } else {
+        source.boxed()
+    };
 
     let reconcile_cache = pd_cached_tokens::is_supported_path(path);
     let cached = if reconcile_cache {
@@ -189,23 +217,20 @@ async fn finalize_decode_response(
         None
     };
 
-    if is_streaming {
+    if is_streaming && (!validate_recomputed || !is_json) {
         let is_sse = headers
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
-        let stream = decode_response.bytes_stream();
         let stream = if validate_recomputed {
-            super::recompute_guard::guard_stream(stream).boxed()
+            super::recompute_guard::guard_stream(source).boxed()
         } else {
-            stream
-                .map(|chunk| chunk.map_err(std::io::Error::other))
-                .boxed()
+            source
         };
         // A streaming request can receive a non-SSE body. Rewrite only upstream
         // event streams whose bytes are already decoded; forward all others.
-        let body = if reconcile_cache && is_sse && !is_encoded {
+        let body = if reconcile_cache && is_sse && (!is_encoded || gzip) {
             Body::from_stream(pd_cached_tokens::rewrite_sse_stream(
                 stream,
                 cached,
@@ -220,34 +245,23 @@ async fn finalize_decode_response(
     // Forward bodies that need no enrichment without waiting for or buffering
     // the complete response, even when the API request is non-streaming.
     if !validate_recomputed && (is_encoded || (!reconcile_cache && !needs_logprobs)) {
-        return response_with_body(
-            status,
-            &headers,
-            Body::from_stream(decode_response.bytes_stream()),
-        );
+        return response_with_body(status, &headers, Body::from_stream(source));
     }
 
     // Bound optional enrichment without breaking large legitimate responses.
     // An oversized body is forwarded verbatim; only its enrichment is skipped.
     const MAX_JSON_REWRITE_BYTES: usize = 8 * 1024 * 1024;
     if !validate_recomputed
-        && decode_response
-            .content_length()
-            .is_some_and(|length| length > MAX_JSON_REWRITE_BYTES as u64)
+        && content_length.is_some_and(|length| length > MAX_JSON_REWRITE_BYTES as u64)
     {
-        return response_with_body(
-            status,
-            &headers,
-            Body::from_stream(decode_response.bytes_stream()),
-        );
+        return response_with_body(status, &headers, Body::from_stream(source));
     }
-    let mut source = decode_response.bytes_stream();
     let mut original = Vec::new();
     while let Some(chunk) = source.next().await {
         let chunk = chunk.map_err(|error| format!("Failed to read Decode response: {error}"))?;
         if !validate_recomputed && chunk.len() > MAX_JSON_REWRITE_BYTES - original.len() {
             let prefix = futures_util::stream::iter([
-                Ok::<_, reqwest::Error>(bytes::Bytes::from(original)),
+                Ok::<_, std::io::Error>(bytes::Bytes::from(original)),
                 Ok(chunk),
             ]);
             return response_with_body(status, &headers, Body::from_stream(prefix.chain(source)));
@@ -279,7 +293,7 @@ async fn finalize_decode_response(
         return Ok(super::recompute_guard::failure_response());
     }
 
-    if original.len() > MAX_JSON_REWRITE_BYTES {
+    if is_streaming || original.len() > MAX_JSON_REWRITE_BYTES {
         return response_with_body(status, &headers, Body::from(original));
     }
 
@@ -1494,6 +1508,7 @@ impl VllmPDRouter {
                     headers,
                     start_time,
                     ec_transfers,
+                    super::recompute_guard::enabled(path, &original_request),
                 )
                 .await;
         }
@@ -1924,6 +1939,7 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         start_time: Instant,
         mut ec_transfers: Option<super::epd::EcTransferGuard>,
+        validate_recomputed: bool,
     ) -> Result<Response, PDRouterError> {
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
@@ -2083,7 +2099,7 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
-            super::recompute_guard::enabled(path, &decode_request),
+            validate_recomputed,
         )
         .await
         .map_err(|message| PDRouterError::NetworkError { message })
@@ -2964,6 +2980,364 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    async fn gzip_bytes(input: &[u8]) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(input);
+        let mut bytes = Vec::new();
+        encoder.read_to_end(&mut bytes).await.unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn large_terminal_responses_are_validated_with_and_without_gzip() {
+        for streaming in [false, true] {
+            for gzip in [false, true] {
+                for interrupted in [false, true] {
+                    // Put the marker after the large content, beyond the enrichment budget.
+                    let size = if streaming {
+                        1024 * 1024
+                    } else {
+                        8 * 1024 * 1024
+                    } + 1;
+                    let json = format!(
+                        "{{\"choices\":[{{\"text\":\"{}\",\"stop_reason\":\"{}\"}}]}}",
+                        "x".repeat(size),
+                        if interrupted { "recomputed" } else { "stop" }
+                    );
+                    let plain = if streaming {
+                        format!(": keep-alive\n\ndata: {json}\n\ndata: [DONE]\n\n")
+                    } else {
+                        json
+                    };
+                    let wire = if gzip {
+                        gzip_bytes(plain.as_bytes()).await
+                    } else {
+                        plain.as_bytes().to_vec()
+                    };
+                    let chunks: Vec<_> = wire
+                        .chunks(997)
+                        .map(|part| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(part)))
+                        .collect();
+                    let decode = axum::http::Response::builder()
+                        .header(
+                            "content-type",
+                            if streaming {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            },
+                        )
+                        .header("content-encoding", if gzip { "gzip" } else { "identity" })
+                        .header("content-length", wire.len())
+                        .header("etag", "upstream-encoded-tag")
+                        .header("content-digest", "encoded-digest")
+                        .header("x-request-id", "kept")
+                        .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                            chunks,
+                        )))
+                        .unwrap()
+                        .into();
+                    let response = finalize_decode_response(
+                        decode,
+                        None,
+                        "/v1/completions",
+                        streaming,
+                        false,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!response.headers().contains_key("content-length"));
+                    if gzip {
+                        assert!(!response.headers().contains_key("content-encoding"));
+                        assert!(!response.headers().contains_key("etag"));
+                        assert!(!response.headers().contains_key("content-digest"));
+                    }
+                    if streaming || !interrupted {
+                        assert_eq!(response.headers()["x-request-id"], "kept");
+                    }
+                    assert_eq!(
+                        response.status(),
+                        if interrupted && !streaming {
+                            StatusCode::BAD_GATEWAY
+                        } else {
+                            StatusCode::OK
+                        }
+                    );
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    if interrupted {
+                        let text = std::str::from_utf8(&bytes).unwrap();
+                        assert!(text.contains("upstream_recomputed"));
+                        assert!(!text.contains("[DONE]"));
+                        assert!(!text.contains(&"x".repeat(100)));
+                    } else {
+                        assert_eq!(bytes.as_ref(), plain.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gzip_corruption_fails_and_concatenated_members_are_checked() {
+        let marker = b"data: {\"choices\":[{\"stop_reason\":\"recomputed\"}]}\n\n";
+        let mut concatenated = gzip_bytes(b": keep-alive\n\n").await;
+        concatenated.extend(gzip_bytes(marker).await);
+        let decode = axum::http::Response::builder()
+            .header("content-type", "text/event-stream")
+            .header("content-encoding", "gzip")
+            .body(concatenated)
+            .unwrap()
+            .into();
+        let response =
+            finalize_decode_response(decode, None, "/v1/chat/completions", true, false, true)
+                .await
+                .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("upstream_recomputed"));
+        for streaming in [false, true] {
+            let mut truncated = gzip_bytes(b"data: {\"choices\":[").await;
+            truncated.truncate(truncated.len() - 5);
+            for wire in [b"invalid gzip".to_vec(), truncated] {
+                let decode = axum::http::Response::builder()
+                    .header(
+                        "content-type",
+                        if streaming {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    )
+                    .header("content-encoding", "gzip")
+                    .body(wire)
+                    .unwrap()
+                    .into();
+                let response = finalize_decode_response(
+                    decode,
+                    None,
+                    "/v1/chat/completions",
+                    streaming,
+                    false,
+                    true,
+                )
+                .await;
+                if streaming {
+                    assert!(
+                        axum::body::to_bytes(response.unwrap().into_body(), usize::MAX)
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    assert!(response.is_err());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_sse_content_type_does_not_bypass_or_stall_validation() {
+        for gzip in [false, true] {
+            for content_type in [None, Some("text/plain"), Some("text/event-stream")] {
+                let plain =
+                    b"data: {\"choices\":[{\"stop_reason\":\"recomputed\"}]}\n\ndata: [DONE]\n\n";
+                let wire = if gzip {
+                    gzip_bytes(plain).await
+                } else {
+                    plain.to_vec()
+                };
+                let source =
+                    futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(wire))])
+                        .chain(futures_util::stream::pending());
+                let mut builder = axum::http::Response::builder()
+                    .header("content-encoding", if gzip { "gzip" } else { "identity" });
+                if let Some(content_type) = content_type {
+                    builder = builder
+                        .header("content-type", content_type)
+                        .header("connection", "content-type");
+                }
+                let decode = builder
+                    .body(reqwest::Body::wrap_stream(source))
+                    .unwrap()
+                    .into();
+                let response =
+                    finalize_decode_response(decode, None, "/v1/completions", true, false, true)
+                        .await
+                        .unwrap();
+                let mut body = response.into_body().into_data_stream();
+                let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(std::str::from_utf8(&chunk)
+                    .unwrap()
+                    .contains("upstream_recomputed"));
+                assert!(body.next().await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_request_with_json_response_still_checks_terminal_reason() {
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        for gzip in [false, true] {
+            for interrupted in [false, true] {
+                let plain = format!("{{ \"choices\":[{{\"stop_reason\":\"{}\"}}], \"usage\":{{\"prompt_tokens_details\":{{\"cached_tokens\":99}}}} }}", if interrupted { "recomputed" } else { "stop" });
+                let wire = if gzip {
+                    gzip_bytes(plain.as_bytes()).await
+                } else {
+                    plain.as_bytes().to_vec()
+                };
+                let decode = axum::http::Response::builder()
+                    .header("content-type", "application/json")
+                    .header("content-encoding", if gzip { "gzip" } else { "identity" })
+                    .body(wire)
+                    .unwrap()
+                    .into();
+                let response = finalize_decode_response(
+                    decode,
+                    Some(&prefill),
+                    "/v1/completions",
+                    true,
+                    false,
+                    true,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if interrupted {
+                        StatusCode::BAD_GATEWAY
+                    } else {
+                        StatusCode::OK
+                    }
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                if !interrupted {
+                    assert_eq!(bytes.as_ref(), plain.as_bytes());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_connection_closes_on_terminal_error_and_downstream_cancel() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            time::{timeout, Duration},
+        };
+        // A real chunked HTTP peer stays open; EOF must come from dropping the response chain.
+        for gzip in [false, true] {
+            for streaming in [false, true] {
+                for terminal in [false, true] {
+                    if terminal && !streaming {
+                        continue;
+                    } // JSON needs the complete body.
+                    let plain = if terminal {
+                        b"data: {\"choices\":[{\"stop_reason\":\"recomputed\"}]}\n\n".as_slice()
+                    } else {
+                        b"data: {".as_slice()
+                    };
+                    let wire = if gzip {
+                        gzip_bytes(plain).await
+                    } else {
+                        plain.to_vec()
+                    };
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let (sent, received) = tokio::sync::oneshot::channel();
+                    let peer = tokio::spawn(async move {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut request = [0; 4096];
+                        assert!(socket.read(&mut request).await.unwrap() > 0);
+                        let header = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: {}\r\nContent-Encoding: {}\r\n\r\n{:x}\r\n",
+                            if streaming { "text/event-stream" } else { "application/json" }, if gzip { "gzip" } else { "identity" }, wire.len());
+                        socket.write_all(header.as_bytes()).await.unwrap();
+                        socket.write_all(&wire).await.unwrap();
+                        socket.write_all(b"\r\n").await.unwrap();
+                        sent.send(()).unwrap();
+                        let mut byte = [0];
+                        assert_eq!(
+                            socket.read(&mut byte).await.unwrap(),
+                            0,
+                            "Decode connection was retained"
+                        );
+                    });
+                    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                    let decode = client
+                        .get(format!("http://{address}/"))
+                        .send()
+                        .await
+                        .unwrap();
+                    received.await.unwrap();
+                    if streaming {
+                        let response = finalize_decode_response(
+                            decode,
+                            None,
+                            "/v1/completions",
+                            true,
+                            false,
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                        let mut body = response.into_body().into_data_stream();
+                        if terminal {
+                            let chunk = timeout(Duration::from_secs(2), body.next())
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .unwrap();
+                            assert!(std::str::from_utf8(&chunk)
+                                .unwrap()
+                                .contains("upstream_recomputed"));
+                            // Keep the downstream body alive and never poll it again.
+                            timeout(Duration::from_secs(2), peer)
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        } else {
+                            assert!(timeout(Duration::from_millis(100), body.next())
+                                .await
+                                .is_err());
+                            drop(body);
+                            timeout(Duration::from_secs(2), peer)
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        }
+                    } else {
+                        let mut pending = tokio::spawn(finalize_decode_response(
+                            decode,
+                            None,
+                            "/v1/completions",
+                            false,
+                            false,
+                            true,
+                        ));
+                        assert!(timeout(Duration::from_millis(100), &mut pending)
+                            .await
+                            .is_err());
+                        pending.abort();
+                        assert!(pending.await.unwrap_err().is_cancelled());
+                        timeout(Duration::from_secs(2), peer)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn recomputed_validation_survives_shared_response_enrichment() {

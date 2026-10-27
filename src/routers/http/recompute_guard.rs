@@ -49,29 +49,47 @@ pub(super) fn failure_response() -> Response {
     (StatusCode::BAD_GATEWAY, Json(recomputed_error())).into_response()
 }
 
-pub(super) fn encoding_error(response: &reqwest::Response) -> Option<Response> {
-    response
-        .headers()
-        .get_all("content-encoding")
-        .iter()
-        .any(|value| {
-            value.to_str().map_or(true, |value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
-            })
-        })
-        .then(|| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(error_value(
-                    "unsupported_upstream_encoding",
-                    "Cannot validate an encoded decode response.",
-                )),
-            )
-                .into_response()
-        })
+// Identity can appear alongside gzip; a second gzip denotes a nested encoding.
+pub(super) fn gzip_encoded(response: &reqwest::Response) -> Result<bool, Box<Response>> {
+    let mut gzip = false;
+    for value in response.headers().get_all("content-encoding") {
+        for coding in value
+            .to_str()
+            .unwrap_or("unsupported")
+            .split(',')
+            .map(str::trim)
+        {
+            if coding.is_empty() || coding.eq_ignore_ascii_case("identity") {
+                continue;
+            }
+            if !gzip && coding.eq_ignore_ascii_case("gzip") {
+                gzip = true;
+                continue;
+            }
+            RouterMetrics::record_pd_error("unsupported_upstream_encoding");
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(error_value(
+                        "unsupported_upstream_encoding",
+                        "Cannot validate this Decode response encoding.",
+                    )),
+                )
+                    .into_response(),
+            ));
+        }
+    }
+    Ok(gzip)
+}
+
+pub(super) fn gunzip<S>(stream: S) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
+where
+    S: Stream<Item = Result<Bytes, io::Error>> + Send,
+{
+    let reader = tokio_util::io::StreamReader::new(Box::pin(stream));
+    let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(reader);
+    decoder.multiple_members(true);
+    tokio_util::io::ReaderStream::new(decoder)
 }
 
 pub(super) fn enabled(path: &str, request: &Value) -> bool {
@@ -79,7 +97,9 @@ pub(super) fn enabled(path: &str, request: &Value) -> bool {
 }
 
 pub(super) fn interrupted(bytes: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(bytes).is_ok_and(|value| is_recomputed(&value))
+    // Escapes can encode either the key or value; keep structural parsing for them.
+    (memchr::memmem::find(bytes, b"recomputed").is_some() || memchr::memchr(b'\\', bytes).is_some())
+        && serde_json::from_slice::<Value>(bytes).is_ok_and(|value| is_recomputed(&value))
 }
 
 // Native vLLM Chat/Completions emit single-line JSON or keep-alive comments,
@@ -105,6 +125,8 @@ where
                 if frame[..frame.len() - 2].strip_prefix(b"data: ")
                     .is_some_and(interrupted) {
                     drop(source);
+                    drop(frame);
+                    drop(raw);
                     yield Bytes::from(format!("data: {}\n\n", recomputed_error()));
                     return;
                 }
@@ -129,17 +151,20 @@ mod tests {
             (vec!["Identity"], false),
             (vec![" identity, IDENTITY "], false),
             (vec!["identity", "Identity"], false),
-            (vec!["gzip"], true),
-            (vec!["identity, gzip"], true),
-            (vec!["identity", "gzip"], true),
-            (vec!["gzip", "identity"], true),
+            (vec!["gzip"], false),
+            (vec!["identity, gzip"], false),
+            (vec!["identity", "gzip"], false),
+            (vec!["gzip", "identity"], false),
+            (vec!["gzip", "gzip"], true),
+            (vec!["br"], true),
+            (vec!["gzip, br"], true),
         ] {
             let mut response = axum::http::Response::builder();
             for value in &values {
                 response = response.header("content-encoding", *value);
             }
             let response = reqwest::Response::from(response.body("").unwrap());
-            let error = encoding_error(&response);
+            let error = gzip_encoded(&response).err();
             assert_eq!(error.is_some(), rejected, "{values:?}");
             if let Some(error) = error {
                 assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
@@ -216,6 +241,19 @@ mod tests {
             json!({"choices":[{"delta":{"content":"x".repeat(1024 * 1024 + 1)}}]})
         );
         assert_eq!(feed(&[input.as_bytes()]), input.as_bytes());
+    }
+
+    #[test]
+    fn prefilter_keeps_escaped_keys_and_values() {
+        assert!(interrupted(
+            br#"{"choices":[{"stop_reason":"\u0072ecomputed"}]}"#
+        ));
+        assert!(interrupted(
+            br#"{"choices":[{"stop_\u0072eason":"recomputed"}]}"#
+        ));
+        assert!(!interrupted(
+            br#"{"choices":[{"text":"recomputed","stop_reason":"stop"}]}"#
+        ));
     }
 
     #[test]

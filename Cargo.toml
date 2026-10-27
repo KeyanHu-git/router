@@ -15,6 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 async-stream = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+tokio-util = { version = "0.7", features = ["io"] }
+memchr = "2"
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
 tower = { version = "0.5", features = ["full"] }
@@ -271,6 +274,10 @@ path = "tests/rust/test_pd_routing.rs"
 [[test]]
 name = "test_prompt_input"
 path = "tests/rust/test_prompt_input.rs"
+
+[[test]]
+name = "test_recomputed_terminal"
+path = "tests/rust/test_recomputed_terminal.rs"
 
 [[test]]
 name = "test_transparent_proxy_routing"
