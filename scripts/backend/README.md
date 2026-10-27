@@ -108,7 +108,7 @@ By default it runs one concurrent wave. Pass `--warmup` to first send a serial
 miss/hit pair that primes prefix-cache state before the wave. Defaults:
 `--hit-rate 0.99`, `--chars 8000`, `--max-tokens 16`,
 `--concurrency 1`, and `--requests 2 * concurrency`.
-`tests/test_bench_prefix_kvhit.py` is the unit test for this client script; it
+`tests/python/test_bench_prefix_kvhit.py` is the unit test for this client script; it
 does not test live prefix-cache behavior.
 
 | What | Flag | Env | Meaning |
@@ -238,15 +238,15 @@ are not a forever ban on a gRPC text prompt.
 
 ```bash
 # always-on, in-process mock (no GPU, no vllm-rs)
-cargo test --test grpc_vs_http_e2e
-cargo test --lib backend::
+cargo test --features cpu,ready --test grpc_vs_http_e2e
+cargo test --features cpu,ready --lib backend::
 
 # optional: rust vllm-chat ids vs Python vLLM (skips if unset)
 export VLLM_ROUTER_MODEL=/path/to/hf-model   # tokenizer.json required
-cargo test --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
+cargo test --features cpu,ready --lib vllm_chat_tokenize_matches_python_vllm -- --nocapture
 ```
 
 `tests/python_vllm_chat_ids.py` is a helper spawned by the preprocess
 tests (`tests/python_vllm_chat_ids.py MODEL_DIR MESSAGES_JSON`).
-`tests/common/mock_vllm_rs.rs` is the in-process `Inference` server
+`tests/rust/common/mock_vllm_rs.rs` is the in-process `Inference` server
 used by `grpc_vs_http_e2e`. See the router README **Tests** section.
