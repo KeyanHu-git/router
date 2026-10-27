@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cpu", feature = "ready"))]
+
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
